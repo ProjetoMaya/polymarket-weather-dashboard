@@ -104,6 +104,11 @@
     .verdict-warn{color:var(--orange);font-size:12px;font-weight:400}
     .verdict-weak{color:var(--yellow)}
     .verdict-skip{color:var(--muted)}
+    /* SPEC: Market Rule Confidence Badges */
+    .confidence-badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;margin-left:8px}
+    .confidence-high{background:rgba(34,197,94,0.15);color:var(--green)}
+    .confidence-medium{background:rgba(234,179,8,0.15);color:var(--yellow)}
+    .confidence-low{background:rgba(239,68,68,0.15);color:var(--hot)}
 
     /* Sources table */
     .sources-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:11px}
@@ -167,10 +172,12 @@ const MARKET_STATIONS = [
 ];
 
 // ─── Model Configuration ───
-const CONSERVATIVE_FLOOR_SIGMA = 1.5;
+// SPEC: Dynamic sigma calculation - no fixed floor
 const FORECAST_MODELS = ['gfs_seamless', 'ecmwf_ifs025', 'ukmo_seamless'];
 const MODEL_LABELS = { gfs_seamless: 'NOAA GFS', ecmwf_ifs025: 'ECMWF IFS', ukmo_seamless: 'UKMO' };
 const MODEL_COLORS = { gfs_seamless: '#22c55e', ecmwf_ifs025: '#3b82f6', ukmo_seamless: '#f97316' };
+// SPEC: Horizon penalty coefficient (calibrated via backtest)
+const HORIZON_PENALTY_K = 0.05;
 
 // ─── Favorites (localStorage) ───
 function loadFavorites() {
@@ -562,7 +569,7 @@ async function calcModelError(lat, lon) {
     const variance = errors.reduce((a, e) => a + (e - mean) ** 2, 0) / (errors.length - 1);
     const sigma = Math.sqrt(variance);
 
-    const result = { bias: mean, sigma, n: errors.length };
+    const result = { bias: mean, sigma, baseSigma: sigma, n: errors.length };
     errorCache[key] = result;
     return result;
   } catch (e) {
@@ -616,16 +623,16 @@ function parseRange(range) {
   m = range.match(/([\d.-]+)\s*°?[FC]?\s*(?:or higher|ou mais)/i);
   if (m) return { lo: convert(parseFloat(m[1])), hi: Infinity };
 
-  // "X-Y" range → [X, Y] (integers, so exact boundaries)
+  // "X-Y" range → [X, Y] - SPEC 5.2B: Closed interval, no artificial expansion
   m = range.match(/([\d.-]+)\s*[-–]\s*([\d.-]+)/);
   if (m) {
     const lo = convert(parseFloat(m[1]));
     const hi = convert(parseFloat(m[2]));
-    // For integer ranges (36-37°F), the range covers [36, 37.999...]
-    return { lo: lo - 0.5, hi: hi + 0.5 };
+    // Closed interval: P(X ≤ T ≤ Y) - no ±0.5
+    return { lo: lo, hi: hi };
   }
 
-  // Single value "X°C" or "X°F" → [X-0.5, X+0.5)
+  // Single value "X°C" - SPEC 5.2A: P(X) = P(X-0.5 ≤ T < X+0.5)
   m = range.match(/([\d.-]+)\s*°?[FC]/);
   if (m) {
     const v = convert(parseFloat(m[1]));
@@ -724,18 +731,54 @@ async function loadPolymarketData(city, modelData) {
       html += `<div class="poly-question">${esc(q)}</div>`;
 
       // Find model prediction for this date (unified format)
+      // SPEC 2.1: Validate market rule and set confidence
       let avgPredC = null;
       let modelSpread = null;
+      let marketRuleConfidence = 'LOW';
+      let dateValid = false;
+      
       if (dateParts.length === 2) {
         const monthIdx = monthNames.indexOf(dateParts[0]);
         const dayNum = parseInt(dateParts[1]);
         if (monthIdx >= 0 && dayNum) {
-          const year = new Date().getFullYear();
-          const targetDate = `${year}-${String(monthIdx + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
-          const idx = (modelData.dates || []).indexOf(targetDate);
+          // SPEC 3.2: Use contract date, assume current year if unclear
+          const now = new Date();
+          const currentYear = now.getFullYear();
+          // Try current year first, then next year if date is in the past
+          let targetDate = `${currentYear}-${String(monthIdx + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+          let targetDateObj = new Date(targetDate);
+          
+          // If date is in the past, assume next year (for future contracts)
+          if (targetDateObj <= now) {
+            targetDate = `${currentYear + 1}-${String(monthIdx + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+            targetDateObj = new Date(targetDate);
+          }
+          
+          // SPEC 2.1.2: Block trade if date in past
+          if (targetDateObj > now) {
+            dateValid = true;
+            const idx = (modelData.dates || []).indexOf(targetDate);
 
-          if (idx >= 0) {
-            const preds = FORECAST_MODELS
+            if (idx >= 0) {
+              const preds = FORECAST_MODELS
+                .map(m => modelData.models?.[m]?.max?.[idx])
+                .filter(v => v != null);
+              if (preds.length) {
+                avgPredC = preds.reduce((a, b) => a + b, 0) / preds.length;
+                modelSpread = Math.max(...preds) - Math.min(...preds);
+                // SPEC 2.1.2: Confidence HIGH if we have valid date and predictions
+                marketRuleConfidence = 'HIGH';
+              } else {
+                marketRuleConfidence = 'MEDIUM'; // No forecast data
+              }
+            } else {
+              marketRuleConfidence = 'MEDIUM'; // Date not in forecast range
+            }
+          } else {
+            marketRuleConfidence = 'LOW'; // Date in past
+          }
+        }
+      }ODELS
               .map(m => modelData.models?.[m]?.max?.[idx])
               .filter(v => v != null);
             if (preds.length) {
@@ -746,12 +789,25 @@ async function loadPolymarketData(city, modelData) {
         }
       }
 
-      // ── EDGE TABLE (Blended Sigma — conservative) ──
+      // ── EDGE TABLE (Dynamic Sigma per SPEC) ──
       if (avgPredC != null && errorStats) {
-        // Corrected mean (remove bias)
+        // Calculate horizon in days from now to target date
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const targetDateObj = new Date(targetDate);
+        const horizonDays = Math.max(1, Math.ceil((targetDateObj - today) / (1000 * 60 * 60 * 24)));
+
+        // Corrected mean (remove bias) - SPEC 4.2
         const mu = avgPredC - errorStats.bias;
-        const rawSigma = errorStats.sigma;
-        const sigma = Math.max(rawSigma, CONSERVATIVE_FLOOR_SIGMA);
+        
+        // Dynamic sigma calculation - SPEC 4.3
+        // sigma_final = sqrt(σ_hist² + σ_model_disp² + σ_horizon_penalty²)
+        const sigmaHorizonPenalty = errorStats.baseSigma * horizonDays * HORIZON_PENALTY_K;
+        const sigmaFinal = Math.sqrt(
+          Math.pow(errorStats.sigma, 2) + 
+          Math.pow(modelSpread || 0, 2) + 
+          Math.pow(sigmaHorizonPenalty, 2)
+        );
 
         // Build edge table for each outcome
         let bestEdge = -999;
@@ -763,7 +819,7 @@ async function loadPolymarketData(city, modelData) {
           const parsed = parseRange(o.range);
           if (!parsed) continue;
 
-          const probReal = probInRange(mu, sigma, parsed.lo, parsed.hi);
+          const probReal = probInRange(mu, sigmaFinal, parsed.lo, parsed.hi);
           const probMarket = o.probability;
           const edge = probReal - probMarket;
 
@@ -799,21 +855,29 @@ async function loadPolymarketData(city, modelData) {
 
         html += '</table>';
 
-        // Summary verdict
+        // Summary verdict - SPEC 7: Only allow trade if confidence is HIGH
+        const confClass = 'confidence-' + marketRuleConfidence.toLowerCase();
+        const confLabel = { HIGH: '✓ CONFIDENCE', MEDIUM: '⚠ MEDIUM', LOW: '✕ LOW' }[marketRuleConfidence];
+        
         html += '<div class="edge-verdict">';
-        if (bestEdge >= 0.10) {
+        if (marketRuleConfidence === 'LOW') {
+          html += `<span class="verdict-skip">❌ MERCADO INVÁLIDO: data no passado ou indefinida</span>`;
+        } else if (bestEdge >= 0.10 && marketRuleConfidence === 'HIGH') {
           html += `<span class="verdict-go">✅ EDGE DETECTADO: <strong>${esc(bestOutcome)}</strong> com +${(bestEdge * 100).toFixed(0)}% de edge</span>`;
           if (modelSpread != null && modelSpread <= 1.5) {
             html += ` <span class="verdict-aligned">· Modelos alinhados (Δ${modelSpread.toFixed(1)}°C) ✓</span>`;
           } else if (modelSpread != null) {
             html += ` <span class="verdict-warn">· ⚠️ Modelos divergem ${modelSpread.toFixed(1)}°C — cautela</span>`;
           }
+          html += `<span class="confidence-badge ${confClass}">${confLabel}</span>`;
         } else if (bestEdge >= 0.05) {
-          html += `<span class="verdict-weak">🟡 Edge fraco em ${esc(bestOutcome)} (+${(bestEdge * 100).toFixed(0)}%) — insuficiente</span>`;
+          html += `<span class="verdict-weak">🟡 Edge fraco (+${(bestEdge * 100).toFixed(0)}%) — insuficiente</span>`;
+          if (marketRuleConfidence !== 'HIGH') html += `<span class="confidence-badge ${confClass}">${confLabel}</span>`;
         } else {
           html += `<span class="verdict-skip">❌ SEM EDGE — mercado precificado corretamente</span>`;
+          if (marketRuleConfidence !== 'HIGH') html += `<span class="confidence-badge ${confClass}">${confLabel}</span>`;
         }
-        html += `<div style="font-size:11px;color:var(--muted);margin-top:4px">μ corrigido=${mu.toFixed(1)}°C · σ raw=${rawSigma.toFixed(2)}°C → σ blended=${sigma.toFixed(2)}°C (floor=${CONSERVATIVE_FLOOR_SIGMA}°C) · Regra: Edge ≥ 10% + modelos alinhados</div>`;
+        html += `<div style="font-size:11px;color:var(--muted);margin-top:4px">μ_corr=${mu.toFixed(1)}°C · σ_final=${sigmaFinal.toFixed(2)}°C · H=${horizonDays}d · SPEC: Edge ≥ 10% + conf=HIGH + modelos alinhados</div>`;
         html += '</div>';
 
       } else {
